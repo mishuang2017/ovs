@@ -41,6 +41,7 @@
 #include "unaligned.h"
 #include "util.h"
 #include "dpif-provider.h"
+#include "cmap.h"
 
 VLOG_DEFINE_THIS_MODULE(netdev_offload_tc);
 
@@ -102,6 +103,226 @@ static void parse_tc_flower_to_stats(struct tc_flower *flower,
 
 static int get_ufid_adjust_stats(const ovs_u128 *ufid,
                                  struct dpif_flow_stats *stats);
+
+/* When offloading sample action to TC, userspace creates a unique ID
+ * to map sFlow action and tunnel info and passes this ID to kernel
+ * instead of the sFlow info. Psample will send this ID and sampled
+ * packet to userspace. Using the ID, userspace can recover the sFlow
+ * info and send sampled packet to the right sFlow monitoring host.
+ */
+struct offload_sflow {
+    struct nlattr *action;   /* SFlow action. Used in flow_get. */
+    struct nlattr *userdata; /* Struct user_action_cookie. */
+    struct nlattr *actions;  /* All actions to get output tunnel. */
+    struct flow_tnl *tunnel; /* Input tunnel. */
+    ovs_u128 ufid;           /* Flow ufid. */
+};
+
+/* This maps a psample group ID to struct offload_sflow. */
+struct sgid_node {
+    struct cmap_node metadata_node;
+    struct cmap_node id_node;
+    struct ovs_refcount refcount;
+    uint32_t hash;
+    uint32_t id;
+    struct offload_sflow sflow;
+};
+
+static struct ovs_mutex sgid_lock = OVS_MUTEX_INITIALIZER;
+static struct cmap sgid_map = CMAP_INITIALIZER;
+static struct cmap sgid_metadata_map = CMAP_INITIALIZER;
+static struct id_pool *sample_group_ids OVS_GUARDED_BY(sgid_lock);
+
+static void
+sgid_node_free(struct sgid_node *node)
+{
+    if (node) {
+        if (node->sflow.tunnel) {
+            free(node->sflow.tunnel);
+        }
+        if (node->sflow.action) {
+            free(node->sflow.action);
+        }
+        if (node->sflow.actions) {
+            free(node->sflow.actions);
+        }
+        if (node->sflow.userdata) {
+            free(node->sflow.userdata);
+        }
+        free(node);
+    }
+}
+
+static struct sgid_node *
+sgid_find(uint32_t id)
+{
+    const struct cmap_node *node = cmap_find(&sgid_map, id);
+
+    return node ? CONTAINER_OF(node, struct sgid_node, id_node) : NULL;
+}
+
+static uint32_t
+offload_sflow_hash(const struct offload_sflow *sflow)
+{
+    return hash_bytes(&sflow->ufid, sizeof sflow->ufid, 0);
+}
+
+static bool
+offload_sflow_equal(const struct offload_sflow *a,
+                    const struct offload_sflow *b)
+{
+    if (!ovs_u128_equals(a->ufid, b->ufid)) {
+        return false;
+    }
+    /* Action can't be NULL. */
+    if (!a->action || !b->action) {
+        return false;
+    }
+    if (a->action->nla_len != b->action->nla_len
+        || memcmp(a->action, b->action, a->action->nla_len)) {
+        return false;
+    }
+    /* Actions is used to get output tunnel. It can be NULL. */
+    if ((a->actions && !b->actions) || (!a->actions && b->actions)) {
+        return false;
+    }
+    if ((a->actions && b->actions &&
+        a->actions->nla_len != b->actions->nla_len)
+        || memcmp(a->actions, b->actions, a->actions->nla_len)) {
+        return false;
+    }
+    /* Tunnel is used to get input tunnel. It can be NULL. */
+    if (!a->tunnel && !b->tunnel) {
+        return true;
+    }
+    if (!a->tunnel || !b->tunnel) {
+        return false;
+    }
+    return !memcmp(a->tunnel, b->tunnel, sizeof *a->tunnel);
+}
+
+static struct sgid_node *
+sgid_find_equal(const struct offload_sflow *target, uint32_t hash)
+{
+    struct sgid_node *node;
+
+    CMAP_FOR_EACH_WITH_HASH (node, metadata_node, hash, &sgid_metadata_map) {
+        if (offload_sflow_equal(&node->sflow, target)) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static struct sgid_node *
+sgid_ref_equal(const struct offload_sflow *target, uint32_t hash)
+{
+    struct sgid_node *node;
+
+    do {
+        node = sgid_find_equal(target, hash);
+        /* Try again if the node was released before we get the reference. */
+    } while (node && !ovs_refcount_try_ref_rcu(&node->refcount));
+
+    return node;
+}
+
+static void
+offload_sflow_clone(struct offload_sflow *new, const struct offload_sflow *old)
+{
+    new->action = xmemdup(old->action, old->action->nla_len);
+    new->actions = old->actions
+                   ? xmemdup(old->actions, old->actions->nla_len)
+                   : NULL;
+    new->userdata = xmemdup(old->userdata, old->userdata->nla_len);
+    new->tunnel = old->tunnel
+                  ? xmemdup(old->tunnel, sizeof *old->tunnel)
+                  : NULL;
+    new->ufid = old->ufid;
+}
+
+/* Allocate a unique group id for the given set of flow metadata. The id
+ * space is 2^^32 - 1. 0 is reserved.
+ */
+static struct sgid_node *
+sgid_alloc(const struct offload_sflow *sflow, uint32_t hash)
+{
+    struct sgid_node *node = xzalloc(sizeof *node);
+    bool ret;
+
+    node->hash = hash;
+    ovs_refcount_init(&node->refcount);
+    offload_sflow_clone(&node->sflow, sflow);
+
+    ovs_mutex_lock(&sgid_lock);
+    ret = id_pool_alloc_id(sample_group_ids, &node->id);
+    if (!ret) {
+        VLOG_ERR("Can't find a free group ID");
+        ovs_mutex_unlock(&sgid_lock);
+        sgid_node_free(node);
+        return NULL;
+    }
+
+    cmap_insert(&sgid_map, &node->id_node, node->id);
+    cmap_insert(&sgid_metadata_map, &node->metadata_node, node->hash);
+    ovs_mutex_unlock(&sgid_lock);
+    return node;
+}
+
+/* Allocate a unique group id for the given set of flow metadata and
+ * optional actions.
+ */
+static uint32_t
+sgid_alloc_ctx(const struct offload_sflow *sflow)
+{
+    uint32_t hash = offload_sflow_hash(sflow);
+    struct sgid_node *node = sgid_ref_equal(sflow, hash);
+
+    if (!node) {
+        node = sgid_alloc(sflow, hash);
+    }
+
+    return node ? node->id : 0;
+}
+
+static void
+sgid_node_unref(struct sgid_node *node)
+    OVS_EXCLUDED(sgid_lock)
+{
+    ovs_mutex_lock(&sgid_lock);
+    if (node && ovs_refcount_unref(&node->refcount) == 1) {
+        id_pool_free_id(sample_group_ids, node->id);
+        cmap_remove(&sgid_metadata_map, &node->metadata_node, node->hash);
+        cmap_remove(&sgid_map, &node->id_node, node->id);
+        ovsrcu_postpone(sgid_node_free, node);
+    }
+    ovs_mutex_unlock(&sgid_lock);
+}
+
+static void
+sgid_free(uint32_t id)
+{
+    struct sgid_node *node;
+
+    if (!id) {
+        return;
+    }
+
+    node = sgid_find(id);
+    if (node) {
+        sgid_node_unref(node);
+    } else {
+        VLOG_ERR("Freeing nonexistent group ID: %"PRIu32, id);
+    }
+}
+
+static int
+tc_del_flower_filter_and_sgid(struct tcf_id *id)
+{
+    sgid_free(id->sample_group_id);
+    id->sample_group_id = 0;
+    return tc_del_flower_filter(id);
+}
 
 static bool
 is_internal_port(const char *type)
@@ -275,7 +496,7 @@ del_filter_and_ufid_mapping(struct tcf_id *id, const ovs_u128 *ufid,
         }
     }
 
-    err = tc_del_flower_filter(id);
+    err = tc_del_flower_filter_and_sgid(id);
     if (!err) {
         del_ufid_tc_mapping(ufid);
     }
@@ -545,7 +766,7 @@ netdev_tc_flow_flush(struct netdev *netdev)
             continue;
         }
 
-        err = tc_del_flower_filter(&data->id);
+        err = tc_del_flower_filter_and_sgid(&data->id);
         if (!err) {
             del_ufid_tc_mapping_unlocked(&data->ufid);
         }
@@ -2118,6 +2339,11 @@ netdev_tc_parse_nl_actions(struct netdev *netdev, struct tc_flower *flower,
             if (err) {
                 return err;
             }
+        } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_SAMPLE) {
+            struct offload_sflow sflow;
+
+            memset(&sflow, 0, sizeof sflow);
+            sgid_alloc_ctx(&sflow);
         } else {
             VLOG_DBG_RL(&rl, "unsupported put action type: %d",
                         nl_attr_type(nla));
@@ -2853,6 +3079,9 @@ netdev_tc_init_flow_api(struct netdev *netdev)
         tc_cleanup_policer_actions(meter_police_ids, METER_POLICE_IDS_BASE,
                                    METER_POLICE_IDS_MAX);
         ovs_mutex_unlock(&meter_police_ids_mutex);
+        ovs_mutex_lock(&sgid_lock);
+        sample_group_ids = id_pool_create(1, UINT32_MAX - 1);
+        ovs_mutex_unlock(&sgid_lock);
 
         ovsthread_once_done(&once);
     }
