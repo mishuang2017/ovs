@@ -190,6 +190,12 @@ xmemdup(const void *p_, size_t size)
     return p;
 }
 
+void *
+nullable_xmemdup(const void *p_, size_t size)
+{
+    return p_ == NULL || size == 0 ? NULL : xmemdup(p_, size);
+}
+
 char *
 xmemdup0(const char *p_, size_t length)
 {

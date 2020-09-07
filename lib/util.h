@@ -167,6 +167,7 @@ OVS_RETURNS_NONNULL void *xcalloc(size_t, size_t) MALLOC_LIKE;
 OVS_RETURNS_NONNULL void *xzalloc(size_t) MALLOC_LIKE;
 OVS_RETURNS_NONNULL void *xrealloc(void *, size_t);
 OVS_RETURNS_NONNULL void *xmemdup(const void *, size_t) MALLOC_LIKE;
+OVS_RETURNS_NONNULL void *nullable_xmemdup(const void *, size_t) MALLOC_LIKE;
 OVS_RETURNS_NONNULL char *xmemdup0(const char *, size_t) MALLOC_LIKE;
 OVS_RETURNS_NONNULL char *xstrdup(const char *) MALLOC_LIKE;
 char *nullable_xstrdup(const char *) MALLOC_LIKE;
