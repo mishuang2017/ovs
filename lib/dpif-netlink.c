@@ -3393,6 +3393,9 @@ const struct dpif_class dpif_netlink_class = {
     dpif_netlink_meter_set,
     dpif_netlink_meter_get,
     dpif_netlink_meter_del,
+    NULL,                       /* psample_enabled */
+    NULL,                       /* psample_poll */
+    NULL,                       /* psample_poll_wait */
 };
 
 static int

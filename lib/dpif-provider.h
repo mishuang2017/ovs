@@ -492,6 +492,17 @@ struct dpif_class {
      * zero. */
     int (*meter_del)(struct dpif *, ofproto_meter_id meter_id,
                      struct ofputil_meter_stats *, uint16_t n_bands);
+
+    /* Check if psample thread should be created or not */
+    bool (*psample_enabled)(const struct dpif *dpif);
+
+    /* psample thread was created. Poll psample netlink to receive sampled
+     * packets */
+    int (*psample_poll)(const struct dpif *dpif,
+                        struct dpif_upcall_psample *dupcall);
+
+    /* Arranges for the poll loop to wake up when 'psample_poll' returns */
+    void (*psample_poll_wait)(const struct dpif *dpif);
 };
 
 extern const struct dpif_class dpif_netlink_class;
