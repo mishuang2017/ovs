@@ -2522,6 +2522,16 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
         }
     }
 }
+
+const struct dpif_sflow_attr *
+netdev_sflow_attr_get(struct netdev *netdev, uint32_t gid)
+{
+    if (!(netdev && netdev->netdev_class && netdev->netdev_class->sflow_attr_get))
+        return NULL;
+
+    return netdev->netdev_class->sflow_attr_get(gid);
+}
+
 #else
 void
 netdev_set_flow_api_enabled(const struct smap *ovs_other_config OVS_UNUSED)

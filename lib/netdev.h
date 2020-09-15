@@ -249,6 +249,9 @@ int netdev_ports_flow_get(const struct dpif_class *, struct match *match,
                           struct dpif_flow_attrs *attrs,
                           struct ofpbuf *buf);
 
+const struct dpif_sflow_attr *
+netdev_sflow_attr_get(struct netdev *netdev, uint32_t gid);
+
 /* native tunnel APIs */
 /* Structure to pass parameters required to build a tunnel header. */
 struct netdev_tnl_build_header_params {

@@ -874,6 +874,11 @@ struct netdev_class {
     /* Get a block_id from the netdev.
      * Returns the block_id or 0 if none exists for netdev. */
     uint32_t (*get_block_id)(struct netdev *);
+
+    /* Query sFlow attribute by group ID.
+     *
+     * On success returns a const pointer, on failure returns NULL */
+    const struct dpif_sflow_attr *(*sflow_attr_get)(uint32_t gid);
 };
 
 int netdev_register_provider(const struct netdev_class *);
