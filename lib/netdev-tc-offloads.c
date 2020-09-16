@@ -2071,7 +2071,7 @@ probe_tc_block_support(int ifindex)
     }
 }
 
-static const struct dpif_sflow_attr *
+const struct dpif_sflow_attr *
 netdev_tc_sflow_attr_get(uint32_t gid)
 {
     const struct gid_node *node;

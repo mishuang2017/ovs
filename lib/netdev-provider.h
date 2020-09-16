@@ -867,6 +867,10 @@ struct netdev_class {
     int (*flow_del)(struct netdev *, const ovs_u128 *ufid,
                     struct dpif_flow_stats *);
 
+    /* Query sFlow attribute by group ID.
+     * On success returns a const pointer, on failure returns NULL */
+    const struct dpif_sflow_attr *(*sflow_attr_get)(uint32_t gid);
+
     /* Initializies the netdev flow api.
      * Return 0 if successful, otherwise returns a positive errno value. */
     int (*init_flow_api)(struct netdev *);
@@ -875,10 +879,6 @@ struct netdev_class {
      * Returns the block_id or 0 if none exists for netdev. */
     uint32_t (*get_block_id)(struct netdev *);
 
-    /* Query sFlow attribute by group ID.
-     *
-     * On success returns a const pointer, on failure returns NULL */
-    const struct dpif_sflow_attr *(*sflow_attr_get)(uint32_t gid);
 };
 
 int netdev_register_provider(const struct netdev_class *);
@@ -898,6 +898,6 @@ extern const struct netdev_class netdev_tap_class;
 }
 #endif
 
-#define NO_OFFLOAD_API NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+#define NO_OFFLOAD_API NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 
 #endif /* netdev.h */

@@ -37,6 +37,7 @@ int linux_get_ifindex(const char *netdev_name);
             netdev_tc_flow_put,                                 \
             netdev_tc_flow_get,                                 \
             netdev_tc_flow_del,                                 \
+            netdev_tc_sflow_attr_get,                           \
             netdev_tc_init_flow_api
 
 #endif /* netdev-linux.h */
