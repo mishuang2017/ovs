@@ -138,6 +138,7 @@ enum tc_action_type {
     TC_ACT_VLAN_PUSH,
     TC_ACT_GOTO,
     TC_ACT_CT,
+    TC_ACT_SAMPLE,
 };
 
 /* TODO: can we re-use NAT_ACTION_SRC from OVS? */
@@ -203,6 +204,10 @@ struct tc_action {
             bool clear;
             struct ct_nat_info nat;
         } ct;
+        struct {
+            uint32_t action_rate;
+            uint32_t action_group_id;
+        } sample;
      };
 
      enum tc_action_type type;

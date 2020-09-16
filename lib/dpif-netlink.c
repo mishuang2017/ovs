@@ -3390,7 +3390,7 @@ parse_psample_packet(struct dpif_netlink *dpif,
                      struct dpif_netlink_psample *psample,
                      struct dpif_upcall_psample *dupcall)
 {
-    const char *dpif_type_str = dpif_normalize_type(dpif_type(&dpif->dpif));
+    const struct dpif_class *dpif_class = (dpif->dpif).dpif_class;
     struct netdev *dev;
     odp_port_t port;
 
@@ -3406,7 +3406,7 @@ parse_psample_packet(struct dpif_netlink *dpif,
 
     dupcall->iifindex = psample->iifindex;
     port = netdev_ifindex_to_odp_port(dupcall->iifindex);
-    dev = netdev_ports_get(port, dpif_type_str);
+    dev = netdev_ports_get(port, dpif_class);
     if (!dev) {
         return EOPNOTSUPP;
     }
