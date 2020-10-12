@@ -391,6 +391,7 @@ struct ufid_tc_data {
     uint32_t handle;
     int ifindex;
     struct netdev *netdev;
+    uint32_t group_id;
 };
 
 /* Remove matching ufid entry from ufid_tc hashmap. */
@@ -419,16 +420,24 @@ del_ufid_tc_mapping(const ovs_u128 *ufid)
     ovs_mutex_unlock(&ufid_lock);
 }
 
+static uint32_t get_ufid_tc_mapping_group_id(const ovs_u128 *ufid);
+
 /* Wrapper function to delete filter and ufid tc mapping */
 static int
 del_filter_and_ufid_mapping(int ifindex, uint32_t chain, int prio, int handle,
                             uint32_t block_id, const ovs_u128 *ufid)
 {
     int err;
+    uint32_t group_id;
 
+    group_id = get_ufid_tc_mapping_group_id(ufid);
     err = tc_del_filter(ifindex, chain, prio, handle, block_id);
     if (!err) {
         del_ufid_tc_mapping(ufid);
+    }
+
+    if (group_id) {
+        gid_free(group_id);
     }
 
     return err;
@@ -437,7 +446,7 @@ del_filter_and_ufid_mapping(int ifindex, uint32_t chain, int prio, int handle,
 /* Add ufid entry to ufid_tc hashmap. */
 static void
 add_ufid_tc_mapping(const ovs_u128 *ufid, uint32_t chain, int prio, int handle,
-                    struct netdev *netdev, int ifindex)
+                    struct netdev *netdev, int ifindex, uint32_t group_id)
 {
     size_t ufid_hash = hash_bytes(ufid, sizeof *ufid, 0);
     size_t tc_hash = hash_int(hash_int(hash_int(prio, handle), ifindex), chain);
@@ -449,11 +458,33 @@ add_ufid_tc_mapping(const ovs_u128 *ufid, uint32_t chain, int prio, int handle,
     new_data->handle = handle;
     new_data->netdev = netdev_ref(netdev);
     new_data->ifindex = ifindex;
+    new_data->group_id = group_id;
 
     ovs_mutex_lock(&ufid_lock);
     hmap_insert(&ufid_tc, &new_data->ufid_node, ufid_hash);
     hmap_insert(&ufid_tc, &new_data->tc_node, tc_hash);
     ovs_mutex_unlock(&ufid_lock);
+}
+
+/* Get group id from ufid_tc hashmap.
+ */
+static uint32_t
+get_ufid_tc_mapping_group_id(const ovs_u128 *ufid)
+{
+    size_t ufid_hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct ufid_tc_data *data;
+    uint32_t group_id = 0;
+
+    ovs_mutex_lock(&ufid_lock);
+    HMAP_FOR_EACH_WITH_HASH (data, ufid_node, ufid_hash, &ufid_tc) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            group_id = data->group_id;
+            break;
+        }
+    }
+    ovs_mutex_unlock(&ufid_lock);
+
+    return group_id;
 }
 
 /* Get ufid from ufid_tc hashmap.
@@ -1752,7 +1783,7 @@ unlock:
     ovs_mutex_unlock(&add_lock);
     if (!err) {
         add_ufid_tc_mapping(ufid, flower.chain, flower.prio, flower.handle,
-                            netdev, ifindex);
+                            netdev, ifindex, 0);
     }
 
     return err;
