@@ -2820,6 +2820,18 @@ dpif_netlink_recv_purge(struct dpif *dpif_)
     fat_rwlock_unlock(&dpif->upcall_lock);
 }
 
+static void
+dpif_netlink_register_sflow_upcall_cb(struct dpif *dpif,
+                                      sflow_upcall_callback *cb)
+{
+    const char *dpif_type_str = dpif_normalize_type(dpif_type(dpif));
+    struct netdev *dev;
+
+    dev = netdev_get(dpif_type_str);
+    netdev_regsiter_sflow_upcall_cb(dev, cb);
+    netdev_close(dev);
+}
+
 static char *
 dpif_netlink_get_datapath_version(void)
 {
@@ -3978,7 +3990,7 @@ const struct dpif_class dpif_netlink_class = {
     NULL,                       /* register_upcall_cb */
     NULL,                       /* enable_upcall */
     NULL,                       /* disable_upcall */
-    NULL,                       /* register_sflow_upcall_cb */
+    dpif_netlink_register_sflow_upcall_cb,
     dpif_netlink_get_datapath_version, /* get_datapath_version */
     dpif_netlink_ct_dump_start,
     dpif_netlink_ct_dump_next,
