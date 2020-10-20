@@ -83,6 +83,9 @@ struct netdev_flow_api {
     int (*flow_del)(struct netdev *, const ovs_u128 *ufid,
                     struct dpif_flow_stats *);
 
+    /* Registers an upcall callback to process sFlow packet */
+    void (*register_sflow_upcall_cb)(sflow_upcall_callback *);
+
     /* Initializies the netdev flow api.
      * Return 0 if successful, otherwise returns a positive errno value. */
     int (*init_flow_api)(struct netdev *);

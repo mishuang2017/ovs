@@ -666,3 +666,14 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
         }
     }
 }
+
+void
+netdev_regsiter_sflow_upcall_cb(struct netdev *netdev, sflow_upcall_callback *cb)
+{
+    const struct netdev_flow_api *flow_api =
+        ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
+
+    if (flow_api && flow_api->register_sflow_upcall_cb) {
+        flow_api->register_sflow_upcall_cb(cb);
+    }
+}
