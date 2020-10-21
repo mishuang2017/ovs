@@ -869,6 +869,36 @@ typedef int upcall_callback(const struct dp_packet *packet,
 
 void dpif_register_upcall_cb(struct dpif *, upcall_callback *, void *aux);
 
+/* When offloading sample action to TC, userspace creates a unique ID
+ * to map sFlow action and tunnel info and passes this ID to kernel instead
+ * of the sFlow info. psample will send this ID and sampled packet to
+ * userspace. Using the ID, userspace can recover the sFlow info and send
+ * sampled packet to the right sFlow monitoring host.
+ */
+struct dpif_sflow_attr {
+    const struct nlattr *sflow; /* sFlow action */
+    size_t sflow_len;           /* Length of 'sflow' in bytes. */
+
+    void *userdata;             /* struct user_action_cookie */
+    size_t userdata_len;        /* struct user_action_cookie length */
+
+    struct flow_tnl *tunnel;    /* Tunnel info */
+};
+
+/* A sampled packet passed up from driver to userspace.
+ *
+ * After offloading sample action to TC, driver will send sampled packets
+ * to userspace using psample.
+ */
+struct dpif_upcall_psample {
+    struct dp_packet packet;    /* packet data */
+    uint32_t iifindex;          /* input ifindex */
+    const struct dpif_sflow_attr *sflow_attr;
+};
+
+typedef int sflow_upcall_callback(struct dpif_upcall_psample *dupcall);
+void dpif_register_sflow_upcall_cb(struct dpif *, sflow_upcall_callback *);
+
 int dpif_recv_set(struct dpif *, bool enable);
 int dpif_handlers_set(struct dpif *, uint32_t n_handlers);
 int dpif_set_config(struct dpif *, const struct smap *cfg);
