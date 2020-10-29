@@ -22,6 +22,7 @@
 #include "openvswitch/types.h"
 #include "packets.h"
 #include "flow.h"
+#include "dpif-netlink.h"
 
 #ifdef  __cplusplus
 extern "C" {
@@ -127,6 +128,8 @@ int netdev_ports_flow_get(const char *dpif_type, struct match *match,
                           struct ofpbuf *buf);
 int netdev_ports_get_n_flows(const char *dpif_type,
                              odp_port_t port_no, uint64_t *n_flows);
+void netdev_regsiter_nl_sflow_upcall_cb(struct netdev *netdev,
+                                       dpif_netlink_sflow_upcall_callback *cb);
 
 #ifdef  __cplusplus
 }
