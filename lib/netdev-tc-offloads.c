@@ -1399,7 +1399,6 @@ parse_userspace_userdata(const struct nlattr *actions,
         }
     }
 
-    VLOG_ERR_RL(&error_rl, "%s: no sFlow cookie", __func__);
     return EINVAL;
 }
 
@@ -1654,7 +1653,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     NL_ATTR_FOR_EACH(nla, left, actions, actions_len) {
         if (flower.action_count >= TCA_ACT_MAX_NUM) {
             VLOG_DBG_RL(&rl, "Can only support %d actions", TCA_ACT_MAX_NUM);
-            return EOPNOTSUPP;
+            err = EOPNOTSUPP;
+            goto free_group_id;
         }
         action = &flower.actions[flower.action_count];
         if (nl_attr_type(nla) == OVS_ACTION_ATTR_OUTPUT) {
@@ -1681,7 +1681,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
 
             err = parse_put_flow_set_action(&flower, action, set, set_len);
             if (err) {
-                return err;
+                goto free_group_id;
             }
             if (action->type == TC_ACT_ENCAP) {
                 action->encap.tp_dst = info->tp_dst_port;
@@ -1693,7 +1693,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             err = parse_put_flow_set_masked_action(&flower, action, set,
                                                    set_len, true);
             if (err) {
-                return err;
+                goto free_group_id;
             }
         } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_RECIRC) {
             const uint32_t recirc_id = nl_attr_get_u32(nla);
@@ -1796,7 +1796,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
                             case OVS_NAT_ATTR_UNSPEC:
                             case __OVS_NAT_ATTR_MAX:
                                 VLOG_ERR("Unknown nat attribute (%d)", sub_type_nest);
-                                return EINVAL;
+                                err = EINVAL;
+                                goto free_group_id;
                             break;
                             }
                         }
@@ -1833,7 +1834,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             }
             err = parse_sample_action(nla, &sflow_attr, action);
             if (err) {
-                goto unlock;
+                goto free_group_id;
             }
             group_id = gid_alloc_ctx(&sflow_attr);
             action->sample.action_group_id = group_id;
@@ -1850,7 +1851,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             }
             err = parse_userspace_userdata(nla, &sflow_attr);
             if (err) {
-                goto unlock;
+                goto free_group_id;
             }
             sflow_attr.sflow = nla;
             sflow_attr.sflow_len = nla->nla_len;
@@ -1861,7 +1862,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             flower.action_count++;
         } else {
             VLOG_ERR("unsupported put action type: %d", nl_attr_type(nla));
-            return EOPNOTSUPP;
+            err = EOPNOTSUPP;
+            goto free_group_id;
         }
     }
 
@@ -1881,7 +1883,6 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
         if (prio == 0) {
             VLOG_ERR_RL(&rl, "couldn't get tc prio: %s", ovs_strerror(ENOSPC));
             err = ENOSPC;
-            gid_free(group_id);
             goto unlock;
         }
     }
@@ -1896,6 +1897,12 @@ unlock:
     if (!err) {
         add_ufid_tc_mapping(ufid, flower.chain, flower.prio, flower.handle,
                             netdev, ifindex, group_id);
+        return 0;
+    }
+
+free_group_id:
+    if (group_id) {
+        gid_free(group_id);
     }
 
     return err;
