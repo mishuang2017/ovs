@@ -3392,7 +3392,6 @@ parse_psample_packet(struct dpif_netlink *dpif,
 {
     const struct dpif_class *dpif_class = (dpif->dpif).dpif_class;
     struct netdev *dev;
-    odp_port_t port;
 
     dp_packet_use_stub(&dupcall->packet,
                        CONST_CAST(struct nlattr *,
@@ -3405,8 +3404,7 @@ parse_psample_packet(struct dpif_netlink *dpif,
     dp_packet_set_size(&dupcall->packet, nl_attr_get_size(psample->packet));
 
     dupcall->iifindex = psample->iifindex;
-    port = netdev_ifindex_to_odp_port(dupcall->iifindex);
-    dev = netdev_ports_get(port, dpif_class);
+    dev = netdev_get(dpif_class);
     if (!dev) {
         return EOPNOTSUPP;
     }
