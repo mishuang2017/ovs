@@ -28,6 +28,7 @@
 #include <linux/tc_act/tc_tunnel_key.h>
 #include <linux/tc_act/tc_vlan.h>
 #include <linux/tc_act/tc_ct.h>
+#include <linux/tc_act/tc_sample.h>
 #include <linux/gen_stats.h>
 #include <net/if.h>
 #include <unistd.h>
@@ -1051,6 +1052,37 @@ nl_parse_act_gact(struct nlattr *options, struct tc_flower *flower)
     return 0;
 }
 
+static const struct nl_policy sample_policy[] = {
+    [TCA_SAMPLE_PARMS] = { .type = NL_A_UNSPEC,
+                           .min_len = sizeof(struct tc_sample),
+                           .optional = false, },
+    [TCA_SAMPLE_PSAMPLE_GROUP] = { .type = NL_A_U32,
+                                   .optional = false, },
+    [TCA_SAMPLE_RATE] = { .type = NL_A_U32,
+                          .optional = false, },
+};
+
+static int
+nl_parse_act_sample(struct nlattr *options, struct tc_flower *flower)
+{
+    struct nlattr *sample_attrs[ARRAY_SIZE(sample_policy)];
+    struct tc_action *action;
+
+    if (!nl_parse_nested(options, sample_policy, sample_attrs,
+                         ARRAY_SIZE(sample_policy))) {
+        VLOG_ERR_RL(&error_rl, "failed to parse sample action options");
+        return EPROTO;
+    }
+
+    action = &flower->actions[flower->action_count++];
+    action->type = TC_ACT_SAMPLE;
+    action->sample.action_group_id =
+        nl_attr_get_u32(sample_attrs[TCA_SAMPLE_PSAMPLE_GROUP]);
+    action->sample.action_rate = nl_attr_get_u32(sample_attrs[TCA_SAMPLE_RATE]);
+
+    return 0;
+}
+
 static const struct nl_policy mirred_policy[] = {
     [TCA_MIRRED_PARMS] = { .type = NL_A_UNSPEC,
                            .min_len = sizeof(struct tc_mirred),
@@ -1329,6 +1361,8 @@ nl_parse_single_action(struct nlattr *action, struct tc_flower *flower)
         nl_parse_act_csum(act_options, flower);
     } else if (!strcmp(act_kind, "ct")) {
         nl_parse_act_conntrack(act_options, flower);
+    } else if (!strcmp(act_kind, "sample")) {
+        nl_parse_act_sample(act_options, flower);
     } else {
         VLOG_ERR_RL(&error_rl, "unknown tc action kind: %s", act_kind);
         err = EINVAL;
@@ -1830,6 +1864,23 @@ nl_msg_put_act_mirred(struct ofpbuf *request, int ifindex, int action,
     nl_msg_end_nested(request, offset);
 }
 
+static void
+nl_msg_put_act_sample(struct ofpbuf *request, uint32_t rate, uint32_t group_id)
+{
+    size_t offset;
+
+    nl_msg_put_string(request, TCA_ACT_KIND, "sample");
+    offset = nl_msg_start_nested(request, TCA_ACT_OPTIONS | NLA_F_NESTED);
+    {
+        struct tc_sample parm = { .action = TC_ACT_PIPE };
+
+        nl_msg_put_unspec(request, TCA_SAMPLE_PARMS, &parm, sizeof parm);
+        nl_msg_put_u32(request, TCA_SAMPLE_RATE, rate);
+        nl_msg_put_u32(request, TCA_SAMPLE_PSAMPLE_GROUP, group_id);
+    }
+    nl_msg_end_nested(request, offset);
+}
+
 static inline void
 nl_msg_put_act_cookie(struct ofpbuf *request, struct tc_cookie *ck) {
     if (ck->len) {
@@ -2046,6 +2097,13 @@ nl_msg_put_flower_acts(struct ofpbuf *request, struct tc_flower *flower)
                 nl_msg_put_act_push_vlan(request,
                                          action->vlan.vlan_push_id,
                                          action->vlan.vlan_push_prio);
+                nl_msg_end_nested(request, act_offset);
+            }
+            break;
+            case TC_ACT_SAMPLE: {
+                act_offset = nl_msg_start_nested(request, act_index++);
+                nl_msg_put_act_sample(request, action->sample.action_rate,
+                                      action->sample.action_group_id);
                 nl_msg_end_nested(request, act_offset);
             }
             break;

@@ -234,6 +234,7 @@ struct dpif_port;
 int netdev_ports_insert(struct netdev *, const struct dpif_class *,
                         struct dpif_port *);
 struct netdev *netdev_ports_get(odp_port_t port, const struct dpif_class *);
+struct netdev *netdev_get(const struct dpif_class *);
 int netdev_ports_remove(odp_port_t port, const struct dpif_class *);
 odp_port_t netdev_ifindex_to_odp_port(int ifindex);
 struct netdev_flow_dump **netdev_ports_flow_dump_create(
@@ -248,6 +249,9 @@ int netdev_ports_flow_get(const struct dpif_class *, struct match *match,
                           struct dpif_flow_stats *stats,
                           struct dpif_flow_attrs *attrs,
                           struct ofpbuf *buf);
+
+const struct dpif_sflow_attr *
+netdev_sflow_attr_get(struct netdev *netdev, uint32_t gid);
 
 /* native tunnel APIs */
 /* Structure to pass parameters required to build a tunnel header. */

@@ -2348,6 +2348,24 @@ netdev_ports_get(odp_port_t port_no, const struct dpif_class *dpif_class)
     return ret;
 }
 
+struct netdev *
+netdev_get(const struct dpif_class *dpif_class)
+{
+    struct port_to_netdev_data *data;
+    struct netdev *ret = NULL;
+
+    ovs_mutex_lock(&netdev_hmap_mutex);
+    HMAP_FOR_EACH (data, portno_node, &port_to_netdev) {
+        if (data->dpif_class == dpif_class) {
+            ret = netdev_ref(data->netdev);
+            break;
+        }
+    }
+    ovs_mutex_unlock(&netdev_hmap_mutex);
+
+    return ret;
+}
+
 int
 netdev_ports_remove(odp_port_t port_no, const struct dpif_class *dpif_class)
 {
@@ -2522,6 +2540,16 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
         }
     }
 }
+
+const struct dpif_sflow_attr *
+netdev_sflow_attr_get(struct netdev *netdev, uint32_t gid)
+{
+    if (!(netdev && netdev->netdev_class && netdev->netdev_class->sflow_attr_get))
+        return NULL;
+
+    return netdev->netdev_class->sflow_attr_get(gid);
+}
+
 #else
 void
 netdev_set_flow_api_enabled(const struct smap *ovs_other_config OVS_UNUSED)

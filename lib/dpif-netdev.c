@@ -6849,6 +6849,9 @@ const struct dpif_class dpif_netdev_class = {
     dpif_netdev_meter_set,
     dpif_netdev_meter_get,
     dpif_netdev_meter_del,
+    NULL,                       /* psample_enabled */
+    NULL,                       /* psample_poll */
+    NULL,                       /* psample_poll_wait */
 };
 
 static void

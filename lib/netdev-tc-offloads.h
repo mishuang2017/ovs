@@ -39,6 +39,7 @@ int netdev_tc_flow_get(struct netdev *, struct match *,
                        struct dpif_flow_attrs *, struct ofpbuf *);
 int netdev_tc_flow_del(struct netdev *, const ovs_u128 *,
                         struct dpif_flow_stats *);
+const struct dpif_sflow_attr *netdev_tc_sflow_attr_get(uint32_t gid);
 int netdev_tc_init_flow_api(struct netdev *);
 
 #endif /* netdev-tc-offloads.h */

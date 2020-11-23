@@ -38,6 +38,8 @@
 #include "unaligned.h"
 #include "util.h"
 
+#include "cmap.h"
+
 VLOG_DEFINE_THIS_MODULE(netdev_tc_offloads);
 
 static struct vlog_rate_limit error_rl = VLOG_RATE_LIMIT_INIT(60, 5);
@@ -51,6 +53,257 @@ struct netlink_field {
     int flower_offset;
     int size;
 };
+
+/* This maps a psample group ID to struct dpif_sflow_attr for sFlow */
+struct gid_node {
+    struct ovs_list exp_node OVS_GUARDED;
+    struct cmap_node metadata_node;
+    struct cmap_node id_node;
+    struct ovs_refcount refcount;
+    uint32_t hash;
+    uint32_t id;
+    const struct dpif_sflow_attr sflow;
+};
+
+static struct ovs_rwlock gid_rwlock = OVS_RWLOCK_INITIALIZER;
+
+static long long int gid_last_run OVS_GUARDED_BY(gid_rwlock);
+
+static struct cmap gid_map = CMAP_INITIALIZER;
+static struct cmap gid_metadata_map = CMAP_INITIALIZER;
+
+static struct ovs_list gid_expiring OVS_GUARDED_BY(gid_rwlock)
+    = OVS_LIST_INITIALIZER(&gid_expiring);
+static struct ovs_list gid_expired OVS_GUARDED_BY(gid_rwlock)
+    = OVS_LIST_INITIALIZER(&gid_expired);
+
+static uint32_t next_group_id OVS_GUARDED_BY(gid_rwlock) = 1;
+
+#define GID_RUN_INTERVAL   250     /* msec */
+
+static void
+gid_node_free(struct gid_node *node)
+{
+    if (node->sflow.tunnel) {
+        free(node->sflow.tunnel);
+    }
+    free(CONST_CAST(void *, node->sflow.sflow));
+    free(node->sflow.userdata);
+    free(node);
+}
+
+static void
+gid_cleanup(void)
+{
+    long long int now = time_msec();
+    struct gid_node *node;
+
+    /* Do maintenance at most 4 times / sec. */
+    ovs_rwlock_rdlock(&gid_rwlock);
+    if (now - gid_last_run < GID_RUN_INTERVAL) {
+        ovs_rwlock_unlock(&gid_rwlock);
+        return;
+    }
+    ovs_rwlock_unlock(&gid_rwlock);
+
+    ovs_rwlock_wrlock(&gid_rwlock);
+    gid_last_run = now;
+
+    LIST_FOR_EACH_POP (node, exp_node, &gid_expired) {
+        cmap_remove(&gid_map, &node->id_node, node->id);
+        ovsrcu_postpone(gid_node_free, node);
+    }
+
+    if (!ovs_list_is_empty(&gid_expiring)) {
+        /* 'gid_expired' is now empty, move nodes in
+         * 'gid_expiring' to it. */
+        ovs_list_splice(&gid_expired,
+                        ovs_list_front(&gid_expiring),
+                        &gid_expiring);
+    }
+    ovs_rwlock_unlock(&gid_rwlock);
+}
+
+/* Lockless RCU protected lookup.  If node is needed accross RCU quiescent
+ * state, caller should copy the contents. */
+static const struct gid_node *
+gid_find(uint32_t id)
+{
+    const struct cmap_node *node = cmap_find(&gid_map, id);
+
+    return node
+        ? CONTAINER_OF(node, const struct gid_node, id_node)
+        : NULL;
+}
+
+static uint32_t
+dpif_sflow_attr_hash(const struct dpif_sflow_attr *sflow)
+{
+    uint32_t hash1 = hash_bytes(sflow->sflow, sflow->sflow_len, 0);
+    uint32_t hash2;
+
+    if (!sflow->tunnel) {
+        return hash1;
+    }
+
+    hash2 = hash_bytes(sflow->tunnel, sizeof *sflow->tunnel, 0);
+    return hash_add(hash1, hash2);
+}
+
+static bool
+dpif_sflow_attr_equal(const struct dpif_sflow_attr *a,
+                      const struct dpif_sflow_attr *b)
+{
+    if (a->sflow_len != b->sflow_len
+        || memcmp(a->sflow, b->sflow, a->sflow_len)) {
+        return false;
+    }
+    if (!a->tunnel && !b->tunnel) {
+        return true;
+    }
+    if (a->tunnel && b->tunnel) {
+        return !memcmp(a->tunnel, b->tunnel, sizeof *a->tunnel);
+    }
+
+    return false;
+}
+
+/* Lockless RCU protected lookup.  If node is needed accross RCU quiescent
+ * state, caller should take a reference. */
+static struct gid_node *
+gid_find_equal(const struct dpif_sflow_attr *target, uint32_t hash)
+{
+    struct gid_node *node;
+
+    CMAP_FOR_EACH_WITH_HASH (node, metadata_node, hash, &gid_metadata_map) {
+        if (dpif_sflow_attr_equal(&node->sflow, target)) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static struct gid_node *
+gid_ref_equal(const struct dpif_sflow_attr *target, uint32_t hash)
+{
+    struct gid_node *node;
+
+    do {
+        node = gid_find_equal(target, hash);
+        /* Try again if the node was released before we get the reference. */
+    } while (node && !ovs_refcount_try_ref_rcu(&node->refcount));
+
+    return node;
+}
+
+static void
+dpif_sflow_attr_clone(struct dpif_sflow_attr *new,
+                      const struct dpif_sflow_attr *old)
+{
+    new->sflow_len = old->sflow_len;
+    new->sflow = xmalloc(new->sflow_len);
+    memcpy(CONST_CAST(void *, new->sflow), old->sflow, new->sflow_len);
+
+    new->userdata_len = old->userdata_len;
+    new->userdata = xmalloc(new->userdata_len);
+    memcpy(new->userdata, old->userdata, new->userdata_len);
+
+    if (old->tunnel) {
+        new->tunnel = xzalloc(sizeof *new->tunnel);
+        memcpy(new->tunnel, old->tunnel, sizeof *new->tunnel);
+    } else {
+        new->tunnel = NULL;
+    }
+}
+
+/* We use the id as the hash value, which works due to cmap internal rehashing.
+ * We also only insert nodes with unique IDs, so all possible hash collisions
+ * remain internal to the cmap. */
+static struct gid_node *
+gid_find__(uint32_t id)
+    OVS_REQUIRES(gid_wrlock)
+{
+    struct cmap_node *node = cmap_find_protected(&gid_map, id);
+
+    return node ? CONTAINER_OF(node, struct gid_node, id_node) : NULL;
+}
+
+/* Allocate a unique group id for the given set of flow metadata.
+ * The ID space is 2^^32, so there should never be a situation in which all
+ * the IDs are used up.  We loop until we find a free one. */
+static struct gid_node *
+gid_alloc__(const struct dpif_sflow_attr *sflow, uint32_t hash)
+{
+    struct gid_node *node = xzalloc(sizeof *node);
+
+    node->hash = hash;
+    ovs_refcount_init(&node->refcount);
+    dpif_sflow_attr_clone(CONST_CAST(struct dpif_sflow_attr *, &node->sflow),
+                          sflow);
+
+    ovs_rwlock_wrlock(&gid_rwlock);
+    for (;;) {
+        node->id = next_group_id++;
+        if (OVS_UNLIKELY(!node->id)) {
+            next_group_id = 1;
+            node->id = next_group_id++;
+        }
+        /* Find if the id is free. */
+        if (OVS_LIKELY(!gid_find__(node->id))) {
+            break;
+        }
+    }
+    cmap_insert(&gid_map, &node->id_node, node->id);
+    cmap_insert(&gid_metadata_map, &node->metadata_node, node->hash);
+    ovs_rwlock_unlock(&gid_rwlock);
+    return node;
+}
+
+/* Allocate a unique group id for the given set of flow metadata and
+   optional actions. */
+static uint32_t
+gid_alloc_ctx(const struct dpif_sflow_attr *sflow)
+{
+    uint32_t hash = dpif_sflow_attr_hash(sflow);
+    struct gid_node *node = gid_ref_equal(sflow, hash);
+
+    if (!node) {
+        node = gid_alloc__(sflow, hash);
+    }
+    return node->id;
+}
+
+static void
+gid_node_unref(const struct gid_node *node_)
+    OVS_EXCLUDED(gid_rwlock)
+{
+    struct gid_node *node = CONST_CAST(struct gid_node *, node_);
+
+    ovs_rwlock_wrlock(&gid_rwlock);
+    if (node && ovs_refcount_unref(&node->refcount) == 1) {
+        /* Prevent re-use of this node by removing the node from
+         * gid_metadata_map' */
+        cmap_remove(&gid_metadata_map, &node->metadata_node, node->hash);
+        /* We keep the node in the 'gid_map' so that it can be found as
+         * long as it lingers, and add it to the 'gid_expiring' list. */
+        ovs_list_insert(&gid_expiring, &node->exp_node);
+    }
+    ovs_rwlock_unlock(&gid_rwlock);
+}
+
+static void
+gid_free(uint32_t id)
+{
+    const struct gid_node *node;
+
+    node = gid_find(id);
+    if (node) {
+        gid_node_unref(node);
+    } else {
+        VLOG_ERR("Freeing nonexistent group ID: %"PRIu32, id);
+    }
+}
+
 
 static struct netlink_field set_flower_map[][3] = {
     [OVS_KEY_ATTR_IPV4] = {
@@ -138,6 +391,7 @@ struct ufid_tc_data {
     uint32_t handle;
     int ifindex;
     struct netdev *netdev;
+    uint32_t group_id;
 };
 
 /* Remove matching ufid entry from ufid_tc hashmap. */
@@ -166,24 +420,33 @@ del_ufid_tc_mapping(const ovs_u128 *ufid)
     ovs_mutex_unlock(&ufid_lock);
 }
 
+static uint32_t get_ufid_tc_mapping_group_id(const ovs_u128 *ufid);
+
 /* Wrapper function to delete filter and ufid tc mapping */
 static int
 del_filter_and_ufid_mapping(int ifindex, uint32_t chain, int prio, int handle,
                             uint32_t block_id, const ovs_u128 *ufid)
 {
     int err;
+    uint32_t group_id;
 
+    group_id = get_ufid_tc_mapping_group_id(ufid);
     err = tc_del_filter(ifindex, chain, prio, handle, block_id);
     if (!err) {
         del_ufid_tc_mapping(ufid);
     }
+
+    if (group_id) {
+        gid_free(group_id);
+    }
+
     return err;
 }
 
 /* Add ufid entry to ufid_tc hashmap. */
 static void
 add_ufid_tc_mapping(const ovs_u128 *ufid, uint32_t chain, int prio, int handle,
-                    struct netdev *netdev, int ifindex)
+                    struct netdev *netdev, int ifindex, uint32_t group_id)
 {
     size_t ufid_hash = hash_bytes(ufid, sizeof *ufid, 0);
     size_t tc_hash = hash_int(hash_int(hash_int(prio, handle), ifindex), chain);
@@ -195,11 +458,33 @@ add_ufid_tc_mapping(const ovs_u128 *ufid, uint32_t chain, int prio, int handle,
     new_data->handle = handle;
     new_data->netdev = netdev_ref(netdev);
     new_data->ifindex = ifindex;
+    new_data->group_id = group_id;
 
     ovs_mutex_lock(&ufid_lock);
     hmap_insert(&ufid_tc, &new_data->ufid_node, ufid_hash);
     hmap_insert(&ufid_tc, &new_data->tc_node, tc_hash);
     ovs_mutex_unlock(&ufid_lock);
+}
+
+/* Get group id from ufid_tc hashmap.
+ */
+static uint32_t
+get_ufid_tc_mapping_group_id(const ovs_u128 *ufid)
+{
+    size_t ufid_hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct ufid_tc_data *data;
+    uint32_t group_id = 0;
+
+    ovs_mutex_lock(&ufid_lock);
+    HMAP_FOR_EACH_WITH_HASH (data, ufid_node, ufid_hash, &ufid_tc) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            group_id = data->group_id;
+            break;
+        }
+    }
+    ovs_mutex_unlock(&ufid_lock);
+
+    return group_id;
 }
 
 /* Get ufid from ufid_tc hashmap.
@@ -374,6 +659,8 @@ netdev_tc_flow_dump_create(struct netdev *netdev,
     tc_dump_flower_start(ifindex, dump->nl_dump, block_id);
 
     *dump_out = dump;
+
+    gid_cleanup();
 
     return 0;
 }
@@ -606,6 +893,14 @@ parse_tc_flower_to_match(struct tc_flower *flower,
         action = flower->actions;
         for (i = 0; i < flower->action_count; i++, action++) {
             switch (action->type) {
+            case TC_ACT_SAMPLE: {
+                const struct gid_node *node;
+
+                node = gid_find(action->sample.action_group_id);
+                if (node)
+                    nl_msg_put(buf, node->sflow.sflow, node->sflow.sflow_len);
+            }
+            break;
             case TC_ACT_VLAN_POP: {
                 nl_msg_put_flag(buf, OVS_ACTION_ATTR_POP_VLAN);
             }
@@ -1084,6 +1379,77 @@ flower_match_to_tun_opt(struct tc_flower *flower, const struct flow_tnl *tnl,
     flower->mask.tunnel.metadata.present.len = tnl->metadata.present.len;
 }
 
+static int
+parse_userspace_userdata(const struct nlattr *actions,
+                         struct dpif_sflow_attr *sflow_attr)
+{
+    const struct nlattr *nla;
+    unsigned int left;
+
+    NL_NESTED_FOR_EACH_UNSAFE(nla, left, actions) {
+        if (nl_attr_type(nla) == OVS_USERSPACE_ATTR_USERDATA) {
+            struct user_action_cookie *cookie;
+
+            cookie = CONST_CAST(struct user_action_cookie *, nl_attr_get(nla));
+            if (cookie->type == USER_ACTION_COOKIE_SFLOW) {
+                sflow_attr->userdata = CONST_CAST(void *, nl_attr_get(nla));
+                sflow_attr->userdata_len = nl_attr_get_size(nla);
+                return 0;
+            }
+        }
+    }
+
+    return EINVAL;
+}
+
+static int
+parse_action_userspace(const struct nlattr *actions,
+                       struct dpif_sflow_attr *sflow_attr)
+{
+    const struct nlattr *nla;
+    unsigned int left;
+
+    NL_NESTED_FOR_EACH_UNSAFE(nla, left, actions) {
+        if (nl_attr_type(nla) == OVS_ACTION_ATTR_USERSPACE) {
+            return parse_userspace_userdata(nla, sflow_attr);
+        }
+    }
+
+    VLOG_ERR_RL(&error_rl, "%s: no OVS_ACTION_ATTR_USERSPACE attribute",
+                __func__);
+    return EINVAL;
+}
+
+static int
+parse_sample_action(const struct nlattr *actions,
+                    struct dpif_sflow_attr *sflow_attr,
+                    struct tc_action *tc_action)
+{
+    const struct nlattr *nla;
+    unsigned int left;
+    int ret = EINVAL;
+
+    sflow_attr->sflow = actions;
+    sflow_attr->sflow_len = actions->nla_len;
+
+    NL_NESTED_FOR_EACH_UNSAFE(nla, left, actions) {
+        if (nl_attr_type(nla) == OVS_SAMPLE_ATTR_ACTIONS) {
+            ret = parse_action_userspace(nla, sflow_attr);
+        } else if (nl_attr_type(nla) == OVS_SAMPLE_ATTR_PROBABILITY) {
+            tc_action->type = TC_ACT_SAMPLE;
+            tc_action->sample.action_rate = UINT32_MAX / nl_attr_get_u32(nla);
+        } else {
+            return EINVAL;
+        }
+    }
+
+    if (tc_action->sample.action_rate)  {
+        return ret;
+    }
+
+    return EINVAL;
+}
+
 int
 netdev_tc_flow_put(struct netdev *netdev, struct match *match,
                    struct nlattr *actions, size_t actions_len,
@@ -1098,6 +1464,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     const struct flow_tnl *tnl_mask = &mask->tunnel;
     struct tc_action *action;
     uint32_t block_id = 0;
+    uint32_t group_id = 0;
     struct nlattr *nla;
     size_t left;
     uint32_t chain = 0;
@@ -1286,7 +1653,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     NL_ATTR_FOR_EACH(nla, left, actions, actions_len) {
         if (flower.action_count >= TCA_ACT_MAX_NUM) {
             VLOG_DBG_RL(&rl, "Can only support %d actions", TCA_ACT_MAX_NUM);
-            return EOPNOTSUPP;
+            err = EOPNOTSUPP;
+            goto free_group_id;
         }
         action = &flower.actions[flower.action_count];
         if (nl_attr_type(nla) == OVS_ACTION_ATTR_OUTPUT) {
@@ -1313,7 +1681,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
 
             err = parse_put_flow_set_action(&flower, action, set, set_len);
             if (err) {
-                return err;
+                goto free_group_id;
             }
             if (action->type == TC_ACT_ENCAP) {
                 action->encap.tp_dst = info->tp_dst_port;
@@ -1325,7 +1693,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             err = parse_put_flow_set_masked_action(&flower, action, set,
                                                    set_len, true);
             if (err) {
-                return err;
+                goto free_group_id;
             }
         } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_RECIRC) {
             const uint32_t recirc_id = nl_attr_get_u32(nla);
@@ -1428,7 +1796,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
                             case OVS_NAT_ATTR_UNSPEC:
                             case __OVS_NAT_ATTR_MAX:
                                 VLOG_ERR("Unknown nat attribute (%d)", sub_type_nest);
-                                return EINVAL;
+                                err = EINVAL;
+                                goto free_group_id;
                             break;
                             }
                         }
@@ -1457,9 +1826,44 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             action->ct.clear = true;
             action->type = TC_ACT_CT;
             flower.action_count++;
+        } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_SAMPLE) {
+            struct dpif_sflow_attr sflow_attr = {0};
+
+            if (flower.tunnel) {
+                sflow_attr.tunnel = CONST_CAST(struct flow_tnl *, tnl);
+            }
+            err = parse_sample_action(nla, &sflow_attr, action);
+            if (err) {
+                goto free_group_id;
+            }
+            group_id = gid_alloc_ctx(&sflow_attr);
+            action->sample.action_group_id = group_id;
+            flower.action_count++;
+        } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_USERSPACE) {
+            struct dpif_sflow_attr sflow_attr;
+
+            /* If there is a sFlow cookie inside of a userspace attribute,
+             * but no sample attribute, that means sampling rate is 1.
+             */
+            memset(&sflow_attr, 0, sizeof sflow_attr);
+            if (flower.tunnel) {
+                sflow_attr.tunnel = CONST_CAST(struct flow_tnl *, tnl);
+            }
+            err = parse_userspace_userdata(nla, &sflow_attr);
+            if (err) {
+                goto free_group_id;
+            }
+            sflow_attr.sflow = nla;
+            sflow_attr.sflow_len = nla->nla_len;
+            group_id = gid_alloc_ctx(&sflow_attr);
+            action->type = TC_ACT_SAMPLE;
+            action->sample.action_group_id = group_id;
+            action->sample.action_rate = 1;
+            flower.action_count++;
         } else {
             VLOG_ERR("unsupported put action type: %d", nl_attr_type(nla));
-            return EOPNOTSUPP;
+            err = EOPNOTSUPP;
+            goto free_group_id;
         }
     }
 
@@ -1492,7 +1896,13 @@ unlock:
     ovs_mutex_unlock(&add_lock);
     if (!err) {
         add_ufid_tc_mapping(ufid, flower.chain, flower.prio, flower.handle,
-                            netdev, ifindex);
+                            netdev, ifindex, group_id);
+        return 0;
+    }
+
+free_group_id:
+    if (group_id) {
+        gid_free(group_id);
     }
 
     return err;
@@ -1666,6 +2076,15 @@ probe_tc_block_support(int ifindex)
         block_support = true;
         VLOG_INFO("probe tc: block offload is supported.");
     }
+}
+
+const struct dpif_sflow_attr *
+netdev_tc_sflow_attr_get(uint32_t gid)
+{
+    const struct gid_node *node;
+
+    node = gid_find(gid);
+    return node ? &node->sflow : NULL;
 }
 
 int
