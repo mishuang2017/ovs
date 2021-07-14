@@ -1699,10 +1699,11 @@ dpif_queue_to_priority(const struct dpif *dpif, uint32_t queue_id,
 
 void
 dpif_init(struct dpif *dpif, const struct dpif_class *dpif_class,
-          const char *name,
+          const struct dpif_offload_class *offload_class, const char *name,
           uint8_t netflow_engine_type, uint8_t netflow_engine_id)
 {
     dpif->dpif_class = dpif_class;
+    dpif->offload_class = offload_class;
     dpif->base_name = xstrdup(name);
     dpif->full_name = xasprintf("%s@%s", dpif_class->type, name);
     dpif->netflow_engine_type = netflow_engine_type;

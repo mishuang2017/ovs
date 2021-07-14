@@ -455,20 +455,33 @@ dpif_netlink_open(const struct dpif_class *class OVS_UNUSED, const char *name,
 static int
 open_dpif(const struct dpif_netlink_dp *dp, struct dpif **dpifp)
 {
+    struct registered_dpif_offload_class *registered_offload_class;
+    const char *type = dpif_netlink_class.type;
     struct dpif_netlink *dpif;
+    int error = 0;
 
     dpif = xzalloc(sizeof *dpif);
     dpif->port_notifier = NULL;
     fat_rwlock_init(&dpif->upcall_lock);
 
-    dpif_init(&dpif->dpif, &dpif_netlink_class, dp->name,
-              dp->dp_ifindex, dp->dp_ifindex);
+    dp_offload_initialize();
+    registered_offload_class = dp_offload_class_lookup(type);
+    if (!registered_offload_class) {
+        VLOG_WARN("Could not find offload class for type %s", type);
+        error = EAFNOSUPPORT;
+        goto exit;
+    }
+
+    dpif_init(&dpif->dpif, &dpif_netlink_class,
+              registered_offload_class->offload_class,
+              dp->name, dp->dp_ifindex, dp->dp_ifindex);
 
     dpif->dp_ifindex = dp->dp_ifindex;
     dpif->user_features = dp->user_features;
     *dpifp = &dpif->dpif;
 
-    return 0;
+exit:
+    return error;
 }
 
 #ifdef _WIN32
@@ -713,6 +726,7 @@ dpif_netlink_close(struct dpif *dpif_)
 {
     struct dpif_netlink *dpif = dpif_netlink_cast(dpif_);
 
+    dpif_offload_close(dpif_);
     nl_sock_destroy(dpif->port_notifier);
 
     fat_rwlock_wrlock(&dpif->upcall_lock);

@@ -1674,7 +1674,8 @@ create_dpif_netdev(struct dp_netdev *dp)
     ovs_refcount_ref(&dp->ref_cnt);
 
     dpif = xmalloc(sizeof *dpif);
-    dpif_init(&dpif->dpif, dp->class, dp->name, netflow_id >> 8, netflow_id);
+    dpif_init(&dpif->dpif, dp->class, NULL, dp->name, netflow_id >> 8,
+              netflow_id);
     dpif->dp = dp;
     dpif->last_port_seq = seq_read(dp->port_seq);
 
