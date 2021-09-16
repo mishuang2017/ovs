@@ -88,6 +88,30 @@ As you can see above the none-offload case reports 140 bytes more, which is 14
 bytes per packet. This represents the L2 header, in this case, 2 * *Ethernet
 address* + *Ethertype*.
 
+Tunnel offload
+++++++++++++++
+
+Current tunnel offload ignores DF and CSUM flags configuration requested by
+the user. TC for now has no way to pass these flags in a flower key and their
+masks are set by default. To make tunnel offload work, DF and CSUM flags
+are cleared. So please be aware of the following differences.
+
+Dumping vxlan decap match without offload, it shows::
+
+    recirc_id(0),tunnel(tun_id=0x4,src=192.168.1.1,dst=192.168.1.2,flags(-df+csum+key)),in_port(vxlan_sys_4789)
+
+Dumping vxlan decap match with offload, it shows::
+
+    recirc_id(0),tunnel(tun_id=0x4,src=192.168.1.1,dst=192.168.1.2,tp_dst=4789,flags(+key)),in_port(vxlan_sys_4789)
+
+Dumping vxlan encap action without offload, it shows::
+
+    actions:set(tunnel(tun_id=0x4,dst=192.168.1.1,ttl=64,tp_dst=4789,flags(df|key))),vxlan_sys_4789
+
+Dumping vxlan encap action with offload, it shows::
+
+    actions:set(tunnel(tun_id=0x4,dst=192.168.1.64,ttl=64,tp_dst=4789,flags(key))),vxlan_sys_4789
+
 TC Meter Offload
 ~~~~~~~~~~~~~~~~
 
