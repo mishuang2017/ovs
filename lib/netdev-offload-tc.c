@@ -18,6 +18,8 @@
 
 #include <errno.h>
 #include <linux/if_ether.h>
+#include <linux/psample.h>
+#include <poll.h>
 
 #include "dpif.h"
 #include "hash.h"
@@ -104,6 +106,9 @@ static void parse_tc_flower_to_stats(struct tc_flower *flower,
 static int get_ufid_adjust_stats(const ovs_u128 *ufid,
                                  struct dpif_flow_stats *stats);
 
+static struct nl_sock *psample_sock;
+static int psample_family;
+
 /* When offloading sample action to TC, userspace creates a unique ID
  * to map sFlow action and tunnel info and passes this ID to kernel
  * instead of the sFlow info. Psample will send this ID and sampled
@@ -159,6 +164,19 @@ sgid_find(uint32_t id)
     const struct cmap_node *node = cmap_find(&sgid_map, id);
 
     return node ? CONTAINER_OF(node, struct sgid_node, id_node) : NULL;
+}
+
+static struct offload_sflow *
+sflow_find(uint32_t id)
+{
+    struct sgid_node *node;
+
+    node = sgid_find(id);
+    if (!node) {
+        return NULL;
+    }
+
+    return &node->sflow;
 }
 
 static uint32_t
@@ -3023,6 +3041,55 @@ tc_cleanup_policer_actions(struct id_pool *police_ids,
     hmap_destroy(&map);
 }
 
+static void
+psample_init(void)
+{
+    unsigned int psample_mcgroup;
+    int err;
+
+    if (!netdev_is_flow_api_enabled()) {
+        VLOG_DBG("Flow API is not enabled.");
+        return;
+    }
+
+    if (psample_sock) {
+        VLOG_DBG("Psample socket is already initialized.");
+        return;
+    }
+
+    err = nl_lookup_genl_family(PSAMPLE_GENL_NAME,
+                                &psample_family);
+    if (err) {
+        VLOG_INFO("Generic Netlink family '%s' does not exist: %s\n"
+                  "Please make sure the kernel module psample is loaded.",
+                  PSAMPLE_GENL_NAME, ovs_strerror(err));
+        return;
+    }
+
+    err = nl_lookup_genl_mcgroup(PSAMPLE_GENL_NAME,
+                                 PSAMPLE_NL_MCGRP_SAMPLE_NAME,
+                                 &psample_mcgroup);
+    if (err) {
+        VLOG_WARN("Failed to join Netlink multicast group '%s': %s",
+                  PSAMPLE_NL_MCGRP_SAMPLE_NAME, ovs_strerror(err));
+        return;
+    }
+
+    err = nl_sock_create(NETLINK_GENERIC, &psample_sock);
+    if (err) {
+        VLOG_WARN("Failed to create psample socket: %s", ovs_strerror(err));
+        return;
+    }
+
+    err = nl_sock_join_mcgroup(psample_sock, psample_mcgroup);
+    if (err) {
+        VLOG_WARN("Failed to join psample mcgroup: %s", ovs_strerror(err));
+        nl_sock_destroy(psample_sock);
+        psample_sock = NULL;
+        return;
+    }
+}
+
 static int
 netdev_tc_init_flow_api(struct netdev *netdev)
 {
@@ -3082,6 +3149,7 @@ netdev_tc_init_flow_api(struct netdev *netdev)
         ovs_mutex_lock(&sgid_lock);
         sample_group_ids = id_pool_create(1, UINT32_MAX - 1);
         ovs_mutex_unlock(&sgid_lock);
+        psample_init();
 
         ovsthread_once_done(&once);
     }
@@ -3298,6 +3366,137 @@ meter_tc_del_policer(ofproto_meter_id meter_id,
     return err;
 }
 
+struct offload_psample {
+    struct nlattr *packet; /* Packet data. */
+    int group_id;          /* Mapping id for sFlow offload. */
+    int iifindex;          /* Input ifindex. */
+};
+
+static int
+psample_from_ofpbuf(struct offload_psample *psample,
+                    struct ofpbuf *buf)
+{
+    static const struct nl_policy ovs_psample_policy[] = {
+        [PSAMPLE_ATTR_IIFINDEX] = { .type = NL_A_U16 },
+        [PSAMPLE_ATTR_SAMPLE_GROUP] = { .type = NL_A_U32 },
+        [PSAMPLE_ATTR_GROUP_SEQ] = { .type = NL_A_U32 },
+        [PSAMPLE_ATTR_DATA] = { .type = NL_A_UNSPEC },
+    };
+    struct nlattr *a[ARRAY_SIZE(ovs_psample_policy)];
+    struct genlmsghdr *genl;
+    struct nlmsghdr *nlmsg;
+    struct ofpbuf b;
+
+    b = ofpbuf_const_initializer(buf->data, buf->size);
+    nlmsg = ofpbuf_try_pull(&b, sizeof *nlmsg);
+    genl = ofpbuf_try_pull(&b, sizeof *genl);
+    if (!nlmsg || !genl || nlmsg->nlmsg_type != psample_family
+        || !nl_policy_parse(&b, 0, ovs_psample_policy, a,
+                            ARRAY_SIZE(ovs_psample_policy))) {
+        return EINVAL;
+    }
+
+    psample->iifindex = nl_attr_get_u16(a[PSAMPLE_ATTR_IIFINDEX]);
+    psample->group_id = nl_attr_get_u32(a[PSAMPLE_ATTR_SAMPLE_GROUP]);
+    psample->packet = a[PSAMPLE_ATTR_DATA];
+
+    return 0;
+}
+
+static int
+psample_parse_packet(struct offload_psample *psample,
+                     struct dpif_upcall *upcall)
+{
+    struct flow *flow = &upcall->flow;
+    struct offload_sflow *sflow;
+
+    dp_packet_use_stub(&upcall->packet,
+                       CONST_CAST(struct nlattr *,
+                                  nl_attr_get(psample->packet)) - 1,
+                       nl_attr_get_size(psample->packet) +
+                       sizeof(struct nlattr));
+    dp_packet_set_data(&upcall->packet,
+                       (char *) dp_packet_data(&upcall->packet) +
+                       sizeof(struct nlattr));
+    dp_packet_set_size(&upcall->packet, nl_attr_get_size(psample->packet));
+
+    sflow = sflow_find(psample->group_id);
+    if (!sflow) {
+        return ENOENT;
+    }
+
+    upcall->key = NULL;
+    upcall->key_len = 0;
+    upcall->ufid = sflow->ufid;
+    upcall->userdata = sflow->userdata;
+    upcall->actions = sflow->actions;
+    memset(flow, 0, sizeof *flow);
+    if (sflow->tunnel) {
+        memcpy(&flow->tunnel, sflow->tunnel, sizeof flow->tunnel);
+    }
+    flow->in_port.odp_port = netdev_ifindex_to_odp_port(psample->iifindex);
+    upcall->type = DPIF_UC_ACTION;
+
+    return 0;
+}
+
+static int
+offload_recv(struct dpif_upcall *upcall, struct ofpbuf *buf,
+             uint32_t handler_id)
+{
+    int read_tries = 0;
+
+    if (handler_id) {
+        return EAGAIN;
+    }
+
+    if (!psample_sock) {
+        return ENOENT;
+    }
+
+    for (;;) {
+        struct offload_psample psample;
+        int error;
+
+        if (++read_tries > 50) {
+            return EAGAIN;
+        }
+
+        error = nl_sock_recv(psample_sock, buf, NULL, false);
+        if (error == ENOBUFS) {
+            continue;
+        }
+
+        if (error) {
+            if (error == EAGAIN) {
+                break;
+            }
+            return error;
+        }
+
+        error = psample_from_ofpbuf(&psample, buf);
+        if (!error) {
+            return psample_parse_packet(&psample, upcall);
+        } else if (error) {
+            return error;
+        }
+    }
+
+    return EAGAIN;
+}
+
+static void
+offload_recv_wait(uint32_t handler_id)
+{
+    if (handler_id) {
+        return;
+    }
+
+    if (psample_sock) {
+        nl_sock_wait(psample_sock, POLLIN);
+    }
+}
+
 const struct netdev_flow_api netdev_offload_tc = {
    .type = "linux_tc",
    .flow_flush = netdev_tc_flow_flush,
@@ -3311,5 +3510,7 @@ const struct netdev_flow_api netdev_offload_tc = {
    .meter_set = meter_tc_set_policer,
    .meter_get = meter_tc_get_policer,
    .meter_del = meter_tc_del_policer,
+   .recv = offload_recv,
+   .recv_wait = offload_recv_wait,
    .init_flow_api = netdev_tc_init_flow_api,
 };

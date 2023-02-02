@@ -836,6 +836,8 @@ struct dpif_upcall {
     struct nlattr *userdata;    /* Argument to OVS_ACTION_ATTR_USERSPACE. */
     struct nlattr *out_tun_key;    /* Output tunnel key. */
     struct nlattr *actions;    /* Argument to OVS_ACTION_ATTR_USERSPACE. */
+    struct flow flow;          /* Caller provide 'flow' if 'key' is not
+                                  available. */
 };
 
 /* A callback to notify higher layer of dpif about to be purged, so that
