@@ -28,6 +28,8 @@
 extern "C" {
 #endif
 
+struct dpif_upcall;
+
 struct netdev_flow_api {
     char *type;
     /* Flush all offloaded flows from a netdev.
@@ -120,6 +122,34 @@ struct netdev_flow_api {
      * function for additional details on the 'stats' usage. */
     int (*meter_del)(ofproto_meter_id meter_id,
                      struct ofputil_meter_stats *stats);
+
+    /* Polls for upcall offload packets for an upcall handler. If successful,
+     * stores the upcall into '*upcall', using 'buf' for storage.
+     *
+     * The implementation should point '&upcall->flow' and 'upcall->userdata'
+     * (if any) into data in the caller-provided 'buf'.  The implementation may
+     * also use 'buf' for storing the data of 'upcall->packet'.  If necessary
+     * to make room, the implementation may reallocate the data in 'buf'.
+     *
+     * The caller owns the data of 'upcall->packet' and may modify it.  If
+     * packet's headroom is exhausted as it is manipulated, 'upcall->packet'
+     * will be reallocated.  This requires the data of 'upcall->packet' to be
+     * released with ofpbuf_uninit() before 'upcall' is destroyed.  However,
+     * when an error is returned, the 'upcall->packet' may be uninitialized
+     * and should not be released.
+     *
+     * This function must not block. If no upcall is pending when it is
+     * called, it should return EAGAIN without blocking.
+     *
+     * Return 0 if successful, otherwise returns a positive errno value.
+     */
+    int (*recv)(struct dpif_upcall *upcall, struct ofpbuf *buf,
+                uint32_t handler_id);
+
+    /* Arranges for the poll loop for an upcall handler to wake up when
+     * offload provider has a message queued to be received with the recv
+     * member functions. */
+    void (*recv_wait)(uint32_t handler_id);
 
     /* Initializies the netdev flow api.
      * Return 0 if successful, otherwise returns a positive errno value. */

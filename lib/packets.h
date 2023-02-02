@@ -86,7 +86,7 @@ flow_tnl_size(const struct flow_tnl *src)
  * data in 'dst' is NOT cleared, so this must not be used in cases where the
  * uninitialized portion may be hashed over. */
 static inline void
-flow_tnl_copy__(struct flow_tnl *dst, const struct flow_tnl *src)
+flow_tnl_copy(struct flow_tnl *dst, const struct flow_tnl *src)
 {
     memcpy(dst, src, flow_tnl_size(src));
 }

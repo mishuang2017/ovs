@@ -38,6 +38,7 @@
 #include "netdev-provider.h"
 #include "netdev-vport.h"
 #include "odp-netlink.h"
+#include "odp-util.h"
 #include "openflow/openflow.h"
 #include "packets.h"
 #include "openvswitch/ofp-print.h"
@@ -826,7 +827,7 @@ odp_port_t
 netdev_ifindex_to_odp_port(int ifindex)
 {
     struct port_to_netdev_data *data;
-    odp_port_t ret = 0;
+    odp_port_t ret = ODPP_NONE;
 
     ovs_rwlock_rdlock(&ifindex_to_port_rwlock);
     HMAP_FOR_EACH_WITH_HASH (data, ifindex_node, ifindex, &ifindex_to_port) {

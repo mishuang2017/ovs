@@ -970,7 +970,7 @@ pkt_metadata_from_flow(struct pkt_metadata *md, const struct flow *flow)
 
     md->recirc_id = flow->recirc_id;
     md->dp_hash = flow->dp_hash;
-    flow_tnl_copy__(&md->tunnel, &flow->tunnel);
+    flow_tnl_copy(&md->tunnel, &flow->tunnel);
     md->skb_priority = flow->skb_priority;
     md->pkt_mark = flow->pkt_mark;
     md->in_port = flow->in_port;
