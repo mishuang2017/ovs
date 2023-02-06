@@ -840,10 +840,18 @@ recv_upcalls(struct handler *handler)
             break;
         }
 
-        upcall->fitness = odp_flow_key_to_flow(dupcall->key, dupcall->key_len,
-                                               flow, NULL);
-        if (upcall->fitness == ODP_FIT_ERROR) {
-            goto free_dupcall;
+        /* If key and key_len are available, use them to construct flow.
+         * Otherwise, use upcall->flow.
+         */
+        if (dupcall->key && dupcall->key_len) {
+            upcall->fitness = odp_flow_key_to_flow(dupcall->key,
+                                                   dupcall->key_len,
+                                                   flow, NULL);
+            if (upcall->fitness == ODP_FIT_ERROR) {
+                goto free_dupcall;
+            }
+        } else {
+            flow = &dupcall->flow;
         }
 
         if (dupcall->mru) {
