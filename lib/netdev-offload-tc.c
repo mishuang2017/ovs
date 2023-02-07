@@ -97,6 +97,7 @@ static int police_idx_lookup(uint32_t police_idx, uint32_t *meter_id);
 static int netdev_tc_parse_nl_actions(struct netdev *netdev,
                                       struct tc_flower *flower,
                                       struct offload_info *info,
+                                      const struct flow_tnl *tnl,
                                       const struct nlattr *actions,
                                       size_t actions_len,
                                       bool *recirc_act, bool more_actions,
@@ -137,6 +138,12 @@ static int psample_family;
 static struct ovs_mutex sgid_lock = OVS_MUTEX_INITIALIZER;
 static struct cmap sgid_map = CMAP_INITIALIZER;
 static struct id_pool *sample_group_ids OVS_GUARDED_BY(sgid_lock);
+
+static bool
+psample_supported(void)
+{
+    return psample_sock != NULL;
+}
 
 static void
 sgid_node_free(struct sgid_node *node)
@@ -236,6 +243,30 @@ sgid_free(uint32_t id)
     } else {
         VLOG_ERR("Freeing nonexistent sample group ID: %"PRIu32, id);
     }
+}
+
+static void free_all_flower_sgids(struct tc_flower *flower)
+{
+    const struct tc_action *action = flower->actions;
+
+    for (int i = 0; i < flower->action_count; i++, action++) {
+        if (action->type == TC_ACT_SAMPLE) {
+            sgid_free(action->sample.group_id);
+        }
+    }
+}
+
+static unsigned int get_flower_sgid_count(struct tc_flower *flower)
+{
+    const struct tc_action *action = flower->actions;
+    unsigned int count = 0;
+
+    for (int i = 0; i < flower->action_count; i++, action++) {
+        if (action->type == TC_ACT_SAMPLE && action->sample.group_id) {
+            count++;
+        }
+    }
+    return count;
 }
 
 static bool
@@ -372,7 +403,12 @@ del_ufid_tc_mapping_unlocked(const ovs_u128 *ufid)
     hmap_remove(&ufid_to_tc, &data->ufid_to_tc_node);
     hmap_remove(&tc_to_ufid, &data->tc_to_ufid_node);
     netdev_close(data->netdev);
-    sgid_free(data->sample_group_id[0]);
+    for (int i = 0; i < MAX_TC_SAMPLES_PER_FLOW; i++) {
+        if (!data->sample_group_id[i]) {
+            break;
+        }
+        sgid_free(data->sample_group_id[i]);
+    }
     free(data);
 }
 
@@ -428,10 +464,12 @@ del_filter_and_ufid_mapping(struct tcf_id *id, const ovs_u128 *ufid,
 /* Add ufid entry to ufid_to_tc hashmap. */
 static void
 add_ufid_tc_mapping(struct netdev *netdev, const ovs_u128 *ufid,
-                    struct tcf_id *id, struct dpif_flow_stats *stats)
+                    struct tcf_id *id, struct dpif_flow_stats *stats,
+                    struct tc_flower *flower)
 {
     struct ufid_tc_data *new_data = xzalloc(sizeof *new_data);
     size_t ufid_hash = hash_bytes(ufid, sizeof *ufid, 0);
+    const struct tc_action *action = flower->actions;
     size_t tc_hash;
 
     tc_hash = hash_int(hash_int(id->prio, id->handle), id->ifindex);
@@ -442,6 +480,15 @@ add_ufid_tc_mapping(struct netdev *netdev, const ovs_u128 *ufid,
     new_data->netdev = netdev_ref(netdev);
     if (stats) {
         new_data->adjust_stats = *stats;
+    }
+
+    for (int i = 0, si = 0; i < flower->action_count; i++, action++) {
+        if (action->type == TC_ACT_SAMPLE && action->sample.group_id) {
+            new_data->sample_group_id[si++] = action->sample.group_id;
+            if (si >= MAX_TC_SAMPLES_PER_FLOW) {
+                break;
+            }
+        }
     }
 
     ovs_mutex_lock(&ufid_lock);
@@ -931,6 +978,19 @@ parse_tc_flower_to_actions__(struct tc_flower *flower, struct ofpbuf *buf,
         action = &flower->actions[i];
 
         switch (action->type) {
+        case TC_ACT_SAMPLE: {
+            const struct sgid_node *node;
+
+            node = sgid_find(action->sample.group_id);
+            if (!node) {
+                VLOG_WARN("Can't find sample group ID data for ID: %u",
+                          action->sample.group_id);
+                return ENOENT;
+            }
+            nl_msg_put(buf, node->sample.action,
+                       node->sample.action->nla_len);
+        }
+        break;
         case TC_ACT_VLAN_POP: {
             nl_msg_put_flag(buf, OVS_ACTION_ATTR_POP_VLAN);
         }
@@ -2086,11 +2146,177 @@ parse_match_ct_state_to_flower(struct tc_flower *flower, struct match *match)
     }
 }
 
+static int
+parse_userspace_attributes(const struct nlattr *actions,
+                           struct offload_sample *sample)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    const struct nlattr *nla;
+    unsigned int left;
+
+    NL_NESTED_FOR_EACH_UNSAFE (nla, left, actions) {
+        if (nl_attr_type(nla) == OVS_USERSPACE_ATTR_USERDATA) {
+            struct user_action_cookie cookie;
+
+            memcpy(&cookie, nl_attr_get_unspec(nla, sizeof cookie),
+                   sizeof cookie);
+            if (cookie.type == USER_ACTION_COOKIE_SFLOW) {
+                sample->type = USER_ACTION_COOKIE_SFLOW;
+                sample->userdata = CONST_CAST(struct nlattr *, nla);
+                return 0;
+            }
+        }
+    }
+
+    VLOG_DBG_RL(&rl, "Can't offload userspace action other than sFlow");
+    return EOPNOTSUPP;
+}
+
+static int
+parse_sample_actions_attribute(const struct nlattr *actions,
+                               struct offload_sample *sample)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    const struct nlattr *nla;
+    unsigned int left;
+    int err = EINVAL;
+
+    NL_NESTED_FOR_EACH_UNSAFE (nla, left, actions) {
+        if (nl_attr_type(nla) == OVS_ACTION_ATTR_USERSPACE) {
+            err = parse_userspace_attributes(nla, sample);
+        } else {
+            /* We can't offload other nested actions. */
+            VLOG_DBG_RL(&rl, "Can only offload OVS_ACTION_ATTR_USERSPACE"
+                             " attribute");
+            return EINVAL;
+        }
+    }
+
+    if (err) {
+        VLOG_ERR_RL(&error_rl, "No OVS_ACTION_ATTR_USERSPACE attribute");
+    }
+    return err;
+}
+
+static void
+offload_sample_uninit(struct offload_sample *sample)
+{
+    free(sample->userspace_actions);
+}
+
+static void
+offload_sample_init(struct offload_sample *sample,
+                    const struct nlattr *next_actions,
+                    size_t next_actions_len,
+                    struct tc_flower *flower,
+                    const struct flow_tnl *tnl)
+{
+    memset(sample, 0, sizeof *sample);
+    if (flower->tunnel) {
+        sample->tunnel = CONST_CAST(struct flow_tnl *, tnl);
+    }
+
+    sample->userspace_actions = xmalloc(next_actions_len + NLA_HDRLEN);
+    nullable_memcpy((char *) sample->userspace_actions + NLA_HDRLEN,
+                    next_actions, next_actions_len);
+    sample->userspace_actions->nla_len = next_actions_len + NLA_HDRLEN;
+    sample->ifindex = flower->ifindex;
+}
+
+static int
+parse_sample_action(struct tc_flower *flower, struct tc_action *tc_action,
+                    const struct nlattr *next_actions, size_t next_actions_len,
+                    const struct nlattr *sample_action,
+                    const struct flow_tnl *tnl)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    struct offload_sample sample;
+    const struct nlattr *nla;
+    unsigned int left;
+    uint32_t rate = 0;
+    int ret = EINVAL;
+    uint32_t sgid;
+
+    offload_sample_init(&sample, next_actions, next_actions_len, flower, tnl);
+    sample.action = CONST_CAST(struct nlattr *, sample_action);
+
+    NL_NESTED_FOR_EACH_UNSAFE (nla, left, sample_action) {
+        if (nl_attr_type(nla) == OVS_SAMPLE_ATTR_ACTIONS) {
+            ret = parse_sample_actions_attribute(nla, &sample);
+        } else if (nl_attr_type(nla) == OVS_SAMPLE_ATTR_PROBABILITY) {
+            rate = UINT32_MAX / nl_attr_get_u32(nla);
+        } else {
+            ret = EINVAL;
+            goto err_out;
+        }
+    }
+
+    /* This check makes sure both attributes above were present and valid. */
+    if (!rate || ret) {
+        ret = EINVAL;
+        goto err_out;
+    }
+
+    sgid = sgid_alloc(&sample);
+    if (!sgid) {
+        VLOG_DBG_RL(&rl, "Failed allocating group id for sample action");
+        return ENOENT;
+    }
+
+    tc_action->type = TC_ACT_SAMPLE;
+    tc_action->sample.rate = rate;
+    tc_action->sample.group_id = sgid;
+    flower->action_count++;
+
+    return 0;
+
+err_out:
+    offload_sample_uninit(&sample);
+    return ret;
+}
+
+static int
+parse_userspace_action(struct tc_flower *flower, struct tc_action *tc_action,
+                       const struct nlattr *next_actions,
+                       size_t next_actions_len,
+                       const struct nlattr *userspace_action,
+                       const struct flow_tnl *tnl)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+    struct offload_sample sample;
+    uint32_t sgid;
+    int err;
+
+    offload_sample_init(&sample, next_actions, next_actions_len, flower, tnl);
+
+    /* If sampling rate is 1, there is only a sFlow cookie inside of a
+     * userspace action, but no sample attribute. That means we can
+     * only offload userspace actions for sFlow. */
+    err = parse_userspace_attributes(userspace_action, &sample);
+    if (err) {
+        offload_sample_uninit(&sample);
+        return err;
+    }
+    sample.action = CONST_CAST(struct nlattr *, userspace_action);
+    sgid = sgid_alloc(&sample);
+    if (!sgid) {
+        VLOG_DBG_RL(&rl, "Failed allocating group id for sample action");
+        return ENOENT;
+    }
+    tc_action->type = TC_ACT_SAMPLE;
+    tc_action->sample.group_id = sgid;
+    tc_action->sample.rate = 1;
+    flower->action_count++;
+
+    return 0;
+}
 
 static int
 parse_check_pkt_len_action(struct netdev *netdev, struct tc_flower *flower,
-                           struct offload_info *info, struct tc_action *action,
-                           const struct nlattr *nla, bool last_action,
+                           struct offload_info *info,
+                           const struct flow_tnl *tnl,
+                           struct tc_action *action, const struct nlattr *nla,
+                           bool last_action,
                            struct tc_action **need_jump_update,
                            bool *recirc_act)
 {
@@ -2129,7 +2355,7 @@ parse_check_pkt_len_action(struct netdev *netdev, struct tc_flower *flower,
      * NOTE: The last_action parameter means that there are no more actions
      *       after the if () then ... else () case. */
     nl_actions = a[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER];
-    err = netdev_tc_parse_nl_actions(netdev, flower, info,
+    err = netdev_tc_parse_nl_actions(netdev, flower, info, tnl,
                                      nl_attr_get(nl_actions),
                                      nl_attr_get_size(nl_actions),
                                      recirc_act, !last_action,
@@ -2145,7 +2371,7 @@ parse_check_pkt_len_action(struct netdev *netdev, struct tc_flower *flower,
 
     /* Parse and add the less than action(s). */
     nl_actions = a[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL];
-    err = netdev_tc_parse_nl_actions(netdev, flower, info,
+    err = netdev_tc_parse_nl_actions(netdev, flower, info, tnl,
                                      nl_attr_get(nl_actions),
                                      nl_attr_get_size(nl_actions),
                                      recirc_act, !last_action,
@@ -2198,6 +2424,7 @@ parse_check_pkt_len_action(struct netdev *netdev, struct tc_flower *flower,
 static int
 netdev_tc_parse_nl_actions(struct netdev *netdev, struct tc_flower *flower,
                            struct offload_info *info,
+                           const struct flow_tnl *tnl,
                            const struct nlattr *actions, size_t actions_len,
                            bool *recirc_act, bool more_actions,
                            struct tc_action **need_jump_update)
@@ -2327,7 +2554,8 @@ netdev_tc_parse_nl_actions(struct netdev *netdev, struct tc_flower *flower,
             action->police.index = police_index;
             flower->action_count++;
         } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_CHECK_PKT_LEN) {
-            err = parse_check_pkt_len_action(netdev, flower, info, action, nla,
+            err = parse_check_pkt_len_action(netdev, flower, info, tnl,
+                                             action, nla,
                                              nl_attr_len_pad(nla,
                                                              left) >= left
                                              && !more_actions,
@@ -2336,14 +2564,28 @@ netdev_tc_parse_nl_actions(struct netdev *netdev, struct tc_flower *flower,
             if (err) {
                 return err;
             }
-        } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_SAMPLE) {
-            struct offload_sample sample;
-            uint32_t sgid;
-
-            memset(&sample, 0, sizeof sample);
-            sgid = sgid_alloc(&sample);
-            sgid_free(sgid);
-            return EOPNOTSUPP;
+        } else if (nl_attr_type(nla) == OVS_ACTION_ATTR_SAMPLE ||
+                   nl_attr_type(nla) == OVS_ACTION_ATTR_USERSPACE) {
+            if (!psample_supported()) {
+                VLOG_DBG_RL(&rl, "Unsupported put action type: %d, psample is "
+                            "not initialized successfully", nl_attr_type(nla));
+                return EOPNOTSUPP;
+            }
+            if (get_flower_sgid_count(flower) >= MAX_TC_SAMPLES_PER_FLOW) {
+                VLOG_ERR_RL(&error_rl, "Only %u TC_SAMPLE action per "
+                            "flow is supported", MAX_TC_SAMPLES_PER_FLOW);
+                return EOPNOTSUPP;
+            }
+            if (nl_attr_type(nla) == OVS_ACTION_ATTR_SAMPLE) {
+                err = parse_sample_action(flower, action, actions, actions_len,
+                                          nla, tnl);
+            } else {
+                err = parse_userspace_action(flower, action, actions,
+                                             actions_len, nla, tnl);
+            }
+            if (err) {
+                return err;
+            }
         } else {
             VLOG_DBG_RL(&rl, "unsupported put action type: %d",
                         nl_attr_type(nla));
@@ -2383,6 +2625,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     }
 
     memset(&flower, 0, sizeof flower);
+    flower.ifindex = ifindex;
 
     chain = key->recirc_id;
     mask->recirc_id = 0;
@@ -2660,16 +2903,17 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     }
 
     /* Parse all (nested) actions. */
-    err = netdev_tc_parse_nl_actions(netdev, &flower, info,
+    err = netdev_tc_parse_nl_actions(netdev, &flower, info, tnl,
                                      actions, actions_len, &recirc_act,
                                      false, NULL);
     if (err) {
-        return err;
+        goto error_out;
     }
 
     if ((chain || recirc_act) && !info->recirc_id_shared_with_tc) {
         VLOG_DBG_RL(&rl, "flow_put: recirc_id sharing not supported");
-        return EOPNOTSUPP;
+        err = EOPNOTSUPP;
+        goto error_out;
     }
 
     memset(&adjust_stats, 0, sizeof adjust_stats);
@@ -2683,7 +2927,8 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     prio = get_prio_for_tc_flower(&flower);
     if (prio == 0) {
         VLOG_ERR_RL(&rl, "couldn't get tc prio: %s", ovs_strerror(ENOSPC));
-        return ENOSPC;
+        err = ENOSPC;
+        goto error_out;
     }
 
     flower.act_cookie.data = ufid;
@@ -2692,14 +2937,20 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
     block_id = get_block_id_from_netdev(netdev);
     id = tc_make_tcf_id_chain(ifindex, block_id, chain, prio, hook);
     err = tc_replace_flower(&id, &flower);
-    if (!err) {
-        if (stats) {
-            memset(stats, 0, sizeof *stats);
-            netdev_tc_adjust_stats(stats, &adjust_stats);
-        }
-        add_ufid_tc_mapping(netdev, ufid, &id, &adjust_stats);
+    if (err) {
+        goto error_out;
     }
 
+    if (stats) {
+        memset(stats, 0, sizeof *stats);
+        netdev_tc_adjust_stats(stats, &adjust_stats);
+    }
+
+    add_ufid_tc_mapping(netdev, ufid, &id, &adjust_stats, &flower);
+    return 0;
+
+error_out:
+    free_all_flower_sgids(&flower);
     return err;
 }
 
