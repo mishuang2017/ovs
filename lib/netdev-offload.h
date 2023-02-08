@@ -33,6 +33,7 @@ extern "C" {
 
 struct dp_packet_batch;
 struct dp_packet;
+struct dpif_upcall;
 struct netdev_class;
 struct netdev_rxq;
 struct netdev_saved_flags;
@@ -161,6 +162,10 @@ int netdev_ports_get_n_flows(const char *dpif_type,
 void meter_offload_set(ofproto_meter_id, struct ofputil_meter_config *);
 int meter_offload_get(ofproto_meter_id, struct ofputil_meter_stats *);
 int meter_offload_del(ofproto_meter_id, struct ofputil_meter_stats *);
+
+int netdev_offload_recv(struct dpif_upcall *, struct ofpbuf *,
+                        uint32_t handler_id);
+void netdev_offload_recv_wait(uint32_t handler_id);
 
 #ifdef  __cplusplus
 }
