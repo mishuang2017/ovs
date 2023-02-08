@@ -257,6 +257,41 @@ meter_offload_del(ofproto_meter_id meter_id, struct ofputil_meter_stats *stats)
 }
 
 int
+netdev_offload_recv(struct dpif_upcall *upcall, struct ofpbuf *buf,
+                    uint32_t handler_id)
+{
+    struct netdev_registered_flow_api *rfa;
+    int ret = EAGAIN;
+
+    CMAP_FOR_EACH (rfa, cmap_node, &netdev_flow_apis) {
+        if (rfa->flow_api->recv) {
+            ret = rfa->flow_api->recv(upcall, buf, handler_id);
+            if (ret) {
+                VLOG_DBG_RL(&rl, "Failed to receive offload packet, %s, "
+                            "type: %s", ovs_strerror(ret),
+                            rfa->flow_api->type);
+            } else {
+                return ret;
+            }
+        }
+    }
+
+    return ret;
+}
+
+void
+netdev_offload_recv_wait(uint32_t handler_id)
+{
+    struct netdev_registered_flow_api *rfa;
+
+    CMAP_FOR_EACH (rfa, cmap_node, &netdev_flow_apis) {
+        if (rfa->flow_api->recv_wait) {
+            rfa->flow_api->recv_wait(handler_id);
+        }
+    }
+}
+
+int
 netdev_flow_flush(struct netdev *netdev)
 {
     const struct netdev_flow_api *flow_api =
